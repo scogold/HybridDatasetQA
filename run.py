@@ -1,4 +1,5 @@
 import datasets
+import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, \
     AutoModelForQuestionAnswering, Trainer, TrainingArguments, HfArgumentParser
 import evaluate
@@ -9,6 +10,94 @@ import json
 
 NUM_PREPROCESSING_WORKERS = 2
 
+# Helper to convert references to SQuAD format
+def convert_references_squad_format(references):
+    converted = []
+    for ref in references:
+        if isinstance(ref['answers'], list):
+            ref['answers'] = {
+                'text': [a['text'] for a in ref['answers']],
+                'answer_start': [a['answer_start'] for a in ref['answers']]
+            }
+        converted.append(ref)
+    return converted
+
+def create_mixed_squad_dataset(adversarial_samples=2500, regular_samples=7500):
+    """
+    Creates a mixed dataset combining adversarial SQuAD and regular SQuAD examples.
+    Returns a DatasetDict with train and validation splits.
+    
+    Args:
+        adversarial_samples: Number of examples to take from adversarial SQuAD (default 2000)
+        regular_samples: Number of examples to take from regular SQuAD (default 6000)
+    
+    Returns:
+        A DatasetDict with 'train' and 'validation' splits
+    """
+    print(f"Loading adversarial SQuAD dataset ({adversarial_samples} examples)...")
+    adversarial_data = datasets.load_dataset('jasonamilne/adversarial_squad_datasets', split='validation')
+    adversarial_data = adversarial_data.select(range(min(adversarial_samples, len(adversarial_data))))
+    
+    print(f"Loading regular SQuAD dataset ({regular_samples} examples)...")
+    squad_data = datasets.load_dataset('squad', split='train')
+    squad_data = squad_data.select(range(min(regular_samples, len(squad_data))))
+    
+    # Convert adversarial data to SQuAD format by reconstructing as dicts then converting to dataset
+    print("Converting adversarial dataset to SQuAD format...")
+    converted_examples = []
+    for example in adversarial_data:
+        # Answers are already in dict format {'text': [...], 'answer_start': [...]}
+        # Convert answer_start values to int64 to match SQuAD schema
+        answers = example['answers']
+        if isinstance(answers, dict):
+            answer_start = [int(s) for s in answers.get('answer_start', [])]
+            text = answers.get('text', [])
+        else:
+            # Shouldn't happen, but handle it just in case
+            text = [a['text'] for a in answers]
+            answer_start = [int(a['answer_start']) for a in answers]
+        
+        converted_example = {
+            'id': example['id'],
+            'title': example.get('title', ''),
+            'context': example['context'],
+            'question': example['question'],
+            'answers': {
+                'text': text,
+                'answer_start': answer_start  # Will be int64 when created with from_dict
+            }
+        }
+        converted_examples.append(converted_example)
+    
+    # Create a dataset from the converted examples
+    # Use squad_data's features schema to ensure type compatibility
+    adversarial_converted = datasets.Dataset.from_dict({
+        'id': [ex['id'] for ex in converted_examples],
+        'title': [ex['title'] for ex in converted_examples],
+        'context': [ex['context'] for ex in converted_examples],
+        'question': [ex['question'] for ex in converted_examples],
+        'answers': [ex['answers'] for ex in converted_examples]
+    })
+    
+    # Cast both datasets to ensure they have identical features
+    target_features = squad_data.features
+    adversarial_converted = adversarial_converted.cast(target_features)
+    squad_data_casted = squad_data.cast(target_features)
+    
+    print("Concatenating datasets...")
+    combined_dataset = datasets.concatenate_datasets([adversarial_converted, squad_data_casted])
+    
+    # Split into train and validation (80/20 split)
+    split_dataset = combined_dataset.train_test_split(test_size=0.2, seed=42)
+    
+    # Rename 'test' to 'validation' to match SQuAD format
+    dataset_dict = datasets.DatasetDict({
+        'train': split_dataset['train'],
+        'validation': split_dataset['test']
+    })
+    
+    print(f"Mixed dataset created with {len(dataset_dict['train'])} training and {len(dataset_dict['validation'])} validation examples")
+    return dataset_dict
 
 def main():
     argp = HfArgumentParser(TrainingArguments)
@@ -47,6 +136,12 @@ def main():
                       help='Limit the number of examples to train on.')
     argp.add_argument('--max_eval_samples', type=int, default=None,
                       help='Limit the number of examples to evaluate on.')
+    
+    #Check device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\nUsing device: {device}")
+    if device == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}\n")
 
     training_args, args = argp.parse_args_into_dataclasses()
 
@@ -55,7 +150,12 @@ def main():
     # You need to format the dataset appropriately. For SNLI, you can prepare a file with each line containing one
     # example as follows:
     # {"premise": "Two women are embracing.", "hypothesis": "The sisters are hugging.", "label": 1}
-    if args.dataset.endswith('.json') or args.dataset.endswith('.jsonl'):
+    if args.dataset == 'mixed_squad':
+        # Load mixed dataset combining adversarial and regular SQuAD
+        dataset = create_mixed_squad_dataset()
+        dataset_id = None
+        eval_split = 'validation'
+    elif args.dataset.endswith('.json') or args.dataset.endswith('.jsonl'):
         dataset_id = None
         # Load from local json/jsonl file
         dataset = datasets.load_dataset('json', data_files=args.dataset)
@@ -81,6 +181,10 @@ def main():
     model_class = model_classes[args.task]
     # Initialize the model and tokenizer from the specified pretrained model/checkpoint
     model = model_class.from_pretrained(args.model, **task_kwargs)
+    # Check if GPU is available and print device information
+    
+    #model = model.to(device)  # Move model to GPU if available
+    
     # Make tensor contiguous if needed https://github.com/huggingface/transformers/issues/28293
     if hasattr(model, 'electra'):
         for param in model.electra.parameters():
@@ -119,6 +223,9 @@ def main():
             remove_columns=train_dataset.column_names
         )
     if training_args.do_eval:
+        print(dataset.keys())
+        if eval_split not in dataset:
+            eval_split = 'unmodified' #Set to test if that did not exist, case only for TriviaQA at the moment
         eval_dataset = dataset[eval_split]
         if args.max_eval_samples:
             eval_dataset = eval_dataset.select(range(args.max_eval_samples))
@@ -136,13 +243,16 @@ def main():
     # For an example of a valid compute_metrics function, see compute_accuracy in helpers.py.
     compute_metrics = None
     if args.task == 'qa':
+            
         # For QA, we need to use a tweaked version of the Trainer (defined in helpers.py)
         # to enable the question-answering specific evaluation metrics
         trainer_class = QuestionAnsweringTrainer
         eval_kwargs['eval_examples'] = eval_dataset
         metric = evaluate.load('squad')   # datasets.load_metric() deprecated
         compute_metrics = lambda eval_preds: metric.compute(
-            predictions=eval_preds.predictions, references=eval_preds.label_ids)
+            predictions=eval_preds.predictions,
+            references=convert_references_squad_format(eval_preds.label_ids))
+        
     elif args.task == 'nli':
         compute_metrics = compute_accuracy
     
