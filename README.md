@@ -1,4 +1,4 @@
-This project was developed by Scott Goldin as a final project in the Natural Language course taught at the University of Texas, Austin by Greg Durett.
+This project was developed by Scott Goldin as a final project in the Natural Language Processing course taught at the University of Texas, Austin by Greg Durett.
 
 The code was built out from starter code developed by Kaj Bostrom, Jifan Chen, and Greg Durrett.
 
